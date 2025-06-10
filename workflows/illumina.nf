@@ -49,7 +49,7 @@ if (!variant_caller) { variant_caller = params.protocol == 'amplicon' ? 'ivar' :
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-ch_multiqc_config        = file("$projectDir/assets/multiqc_config_illumina.yml", checkIfExists: true)
+ch_multiqc_config        = file("$projectDir/assets/multiqc_config.yml", checkIfExists: true)
 ch_multiqc_custom_config = params.multiqc_config ? file(params.multiqc_config) : []
 
 // Header files
@@ -67,7 +67,9 @@ ch_ivar_variants_header_mqc      = file("$projectDir/assets/headers/ivar_variant
 // MODULE: Loaded from modules/local/
 //
 include { CUTADAPT } from '../modules/local/cutadapt'
-include { MULTIQC  } from '../modules/local/multiqc_illumina'
+include { MULTIQC_ALADDIN as MULTIQC  } from '../modules/local/multiqc_illumina_aladdin'
+include { MULTIQC_PANGOLIN } from '../modules/local/concise_report'
+
 include { PLOT_MOSDEPTH_REGIONS as PLOT_MOSDEPTH_REGIONS_GENOME   } from '../modules/local/plot_mosdepth_regions'
 include { PLOT_MOSDEPTH_REGIONS as PLOT_MOSDEPTH_REGIONS_AMPLICON } from '../modules/local/plot_mosdepth_regions'
 include { KRAKEN2_UNCLASSIFIED_REMAP    } from '../modules/local/kraken2_viral_remap'
@@ -112,6 +114,12 @@ include { MOSDEPTH as MOSDEPTH_AMPLICON } from '../modules/nf-core/mosdepth/main
 include { FASTQ_ALIGN_BOWTIE2           } from '../subworkflows/nf-core/fastq_align_bowtie2/main'
 include { BAM_MARKDUPLICATES_PICARD     } from '../subworkflows/nf-core/bam_markduplicates_picard/main'
 include { BAM_VARIANT_DEMIX_BOOT_FREYJA } from '../subworkflows/nf-core/bam_variant_demix_boot_freyja/main'
+
+//
+// Aladdin Viralrecon modules
+//
+include { SUMMARIZE_DOWNLOADS           } from '../modules/local/summarize_downloads'
+
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -699,6 +707,7 @@ workflow ILLUMINA {
     // MODULE: MultiQC
     //
     if (!params.skip_multiqc) {
+        multiqc_plugins = Channel.fromPath("${baseDir}/assets/multiqc_plugins/", checkIfExists: true)
         summary_params                        = paramsSummaryMap(
             workflow, parameters_schema: "nextflow_schema.json")
         ch_workflow_summary                   = Channel.value(paramsSummaryMultiqc(summary_params))
@@ -750,10 +759,54 @@ workflow ILLUMINA {
             ch_unicycler_quast_multiqc.collect{it[1]}.ifEmpty([]),
             ch_minia_quast_multiqc.collect{it[1]}.ifEmpty([]),
             ch_freyja_multiqc.collect{it[1]}.ifEmpty([]),
+            multiqc_plugins
         )
 
-        multiqc_report = MULTIQC.out.report.toList()
+        //
+        // MODULE: Generate concise report for Aladdin
+        //
+        ch_multiqc_config_concise = file("$projectDir/assets/multiqc_config_pangolin.yml", checkIfExists: true)
+        MULTIQC_PANGOLIN (
+            ch_multiqc_config_concise,
+            ch_multiqc_logo.toList(),
+            FASTQ_TRIM_FASTP_FASTQC.out.trim_json.collect{it[1]}.ifEmpty([]),
+            ch_pangolin_multiqc.collect{it[1]}.ifEmpty([]),
+            multiqc_plugins
+        )
+
+        multiqc_report          = MULTIQC.out.report
+        multiqc_report_pangolin = MULTIQC_PANGOLIN.out.report
     }
+
+    //
+    //  MODULES: SUMMARIZE_DOWNLOADS
+    //
+
+    if (params.skip_markduplicates) {
+        bam_locations               = FASTQ_ALIGN_BOWTIE2.out.bam
+                                                        .map{ meta, bam -> "${params.outdir}/bowtie2/" + bam.getName()}
+    } else {
+        bam_locations               = BAM_MARKDUPLICATES_PICARD.out.bam
+                                                        .map{ meta, bam -> "${params.outdir}/MarkDuplicates/" + bam.getName()}
+    }
+
+    variants_ivar_locations         = VARIANTS_IVAR.out.tsv.map{ meta, tsv -> "${params.outdir}/variants_ivar/" + tsv.getName() }
+    consensus_ivar_locations        = CONSENSUS_IVAR.out.bases_tsv.map{ meta, bases_tsv -> "${params.outdir}/consensus_ivar/" + bases_tsv[1].getName() }
+    variants_long_table_locations   = VARIANTS_LONG_TABLE.out.long_table.map{ "${params.outdir}/variants_long_table/" + it.getName() }
+
+    report_locations                = multiqc_report
+        .mix(multiqc_report_pangolin)
+        .map{ "${params.outdir}/multiqc/" +  it[0].getName() }
+
+    bam_locations
+        .mix(variants_ivar_locations, consensus_ivar_locations, variants_long_table_locations, report_locations)
+        .collectFile(name: "${params.outdir}/download_data/file_locations.txt", newLine: true )
+        .set { ch_locations }
+
+    SUMMARIZE_DOWNLOADS( 
+        ch_locations, 
+        ch_input    
+    )
 
     emit:
     multiqc_report                  // channel: /path/to/multiqc_report.html
