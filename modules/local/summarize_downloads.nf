@@ -11,6 +11,6 @@ process SUMMARIZE_DOWNLOADS {
 
     script:
     """
-    summarize_downloads.py $locations -d $design
+    python3 ${projectDir}/bin/summarize_downloads.py $locations -d $design
     """
 }
